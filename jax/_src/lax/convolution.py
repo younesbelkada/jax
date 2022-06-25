@@ -14,7 +14,6 @@
 
 import builtins
 from functools import partial
-import operator
 from typing import Any, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -26,9 +25,12 @@ from jax.interpreters import ad
 from jax.interpreters import batching
 from jax.interpreters import masking
 from jax.interpreters import mlir
-from jax._src import util
+from jax.interpreters import xla
+from jax._src.util import safe_zip
 from jax._src.lib.mlir.dialects import mhlo
 from jax._src.lib import xla_client
+
+xops = xla_client.ops
 
 _max = builtins.max
 
@@ -142,15 +144,6 @@ def conv_general_dilated(
     padding = lax.padtype_to_pads(
         np.take(lhs.shape, lhs_perm)[2:], effective_rhs_shape,  # type: ignore[index]
         window_strides, padding)
-  else:
-    try:
-      padding = tuple((operator.index(lo), operator.index(hi))
-                      for lo, hi in padding)
-    except (ValueError, TypeError) as e:
-      raise ValueError(
-        "padding argument to conv_general_dilated should be a string or a "
-        f"sequence of (low, high) pairs, got {padding}") from e
-
   preferred_element_type = (
       None if preferred_element_type is None else
       dtypes.canonicalize_dtype(np.dtype(preferred_element_type)))
@@ -345,6 +338,205 @@ def conv_transpose(lhs: Array, rhs: Array, strides: Sequence[int],
                               preferred_element_type=preferred_element_type)
 
 
+def _deconv_output_length(input_length,
+                          filter_size,
+                          padding,
+                          output_padding=None,
+                          stride=0,
+                          dilation=1):
+  """Determines the output length of a transposed convolution given the input length.
+  Function modified from Keras.
+  Arguments:
+      input_length: Integer.
+      filter_size: Integer.
+      padding: one of `"SAME"`, `"VALID"`, or a 2-integer tuple.
+      output_padding: Integer, amount of padding along the output dimension. Can
+        be set to `None` in which case the output length is inferred.
+      stride: Integer.
+      dilation: Integer.
+  Returns:
+      The output length (integer).
+  """
+  if input_length is None:
+    return None
+
+  # Get the dilated kernel size
+  filter_size = filter_size + (filter_size - 1) * (dilation - 1)
+
+  # Infer length if output padding is None, else compute the exact length
+  if output_padding is None:
+    if padding == 'VALID':
+      length = input_length * stride + max(filter_size - stride, 0)
+    elif padding == 'SAME':
+      length = input_length * stride
+    else:
+      length = ((input_length - 1) * stride + filter_size
+                - padding[0] - padding[1])
+
+  else:
+    if padding == 'SAME':
+      pad = filter_size // 2
+      total_pad = pad * 2
+    elif padding == 'VALID':
+      total_pad = 0
+    else:
+      total_pad = padding[0] + padding[1]
+
+    length = ((input_length - 1) * stride + filter_size - total_pad +
+              output_padding)
+
+  return length
+
+
+def _compute_adjusted_padding(
+    input_size: int,
+    output_size: int,
+    kernel_size: int,
+    stride: int,
+    padding: Union[str, Tuple[int, int]],
+    dilation: int = 1,
+) -> Tuple[int, int]:
+  """Computes adjusted padding for desired ConvTranspose `output_size`.
+  Ported from DeepMind Haiku.
+  """
+  kernel_size = (kernel_size - 1) * dilation + 1
+  if padding == "VALID":
+    expected_input_size = (output_size - kernel_size + stride) // stride
+    if input_size != expected_input_size:
+      raise ValueError(f"The expected input size with the current set of input "
+                       f"parameters is {expected_input_size} which doesn't "
+                       f"match the actual input size {input_size}.")
+    padding_before = 0
+  elif padding == "SAME":
+    expected_input_size = (output_size + stride - 1) // stride
+    if input_size != expected_input_size:
+      raise ValueError(f"The expected input size with the current set of input "
+                       f"parameters is {expected_input_size} which doesn't "
+                       f"match the actual input size {input_size}.")
+    padding_needed = max(0,
+                         (input_size - 1) * stride + kernel_size - output_size)
+    padding_before = padding_needed // 2
+  else:
+    padding_before = padding[0]  # type: ignore[assignment]
+
+  expanded_input_size = (input_size - 1) * stride + 1
+  padded_out_size = output_size + kernel_size - 1
+  pad_before = kernel_size - 1 - padding_before
+  pad_after = padded_out_size - expanded_input_size - pad_before
+  return (pad_before, pad_after)
+
+
+def gradient_based_conv_transpose(lhs: Array, rhs: Array, strides: Sequence[int],
+                                  padding: Union[str, Sequence[Tuple[int, int]]],
+                                  output_padding: Optional[Sequence[int]] = None,
+                                  output_shape: Optional[Sequence[int]] = None,
+                                  dilation: Optional[Sequence[int]] = None,
+                                  dimension_numbers: ConvGeneralDilatedDimensionNumbers = None,
+                                  transpose_kernel: bool = True,
+                                  precision: lax.PrecisionLike = None) -> Array:
+  """Convenience wrapper for calculating the N-d transposed convolution.
+  Much like `conv_transpose`, this function calculates transposed convolutions
+  via fractionally strided convolution rather than calculating the gradient
+  (transpose) of a forward convolution. However, the latter is more common
+  among deep learning frameworks, such as TensorFlow, PyTorch, and Keras.
+  This function provides the same set of APIs to help reproduce results in these frameworks.
+  Args:
+    lhs: a rank `n+2` dimensional input array.
+    rhs: a rank `n+2` dimensional array of kernel weights.
+    strides: sequence of `n` integers, amounts to strides of the corresponding forward convolution.
+    padding: `"SAME"`, `"VALID"`, or a sequence of `n` integer 2-tuples that controls
+      the before-and-after padding for each `n` spatial dimension of
+      the corresponding forward convolution.
+    output_padding: A sequence of integers specifying the amount of padding along
+      each spacial dimension of the output tensor, used to disambiguate the output shape of
+      transposed convolutions when the stride is larger than 1.
+      (see a detailed description at
+      1https://pytorch.org/docs/stable/generated/torch.nn.ConvTranspose2d.html)
+      The amount of output padding along a given dimension must
+      be lower than the stride along that same dimension.
+      If set to `None` (default), the output shape is inferred.
+      If both `output_padding` and `output_shape` are specified, they have to be mutually compatible.
+    output_shape: Output shape of the spatial dimensions of a transpose
+      convolution. Can be `None` or an iterable of `n` integers. If a `None` value is given (default),
+      the shape is automatically calculated.
+      Similar to `output_padding`, `output_shape` is also for disambiguating the output shape
+      when stride > 1 (see also
+      https://www.tensorflow.org/api_docs/python/tf/nn/conv2d_transpose)
+      If both `output_padding` and `output_shape` are specified, they have to be mutually compatible.
+    dilation: `None`, or a sequence of `n` integers, giving the
+      dilation factor to apply in each spatial dimension of `rhs`. Dilated convolution
+      is also known as atrous convolution.
+    dimension_numbers: tuple of dimension descriptors as in
+      lax.conv_general_dilated. Defaults to tensorflow convention.
+    transpose_kernel: if `True` flips spatial axes and swaps the input/output
+      channel axes of the kernel. This makes the output of this function identical
+      to the gradient-derived functions like keras.layers.Conv2DTranspose and
+      torch.nn.ConvTranspose2d applied to the same kernel.
+      Although for typical use in neural nets this is unnecessary
+      and makes input/output channel specification confusing, you need to set this to `True`
+      in order to match the behavior in many deep learning frameworks, such as TensorFlow, Keras, and PyTorch.
+    precision: Optional. Either ``None``, which means the default precision for
+      the backend, a ``lax.Precision`` enum value (``Precision.DEFAULT``,
+      ``Precision.HIGH`` or ``Precision.HIGHEST``) or a tuple of two
+      ``lax.Precision`` enums indicating precision of ``lhs``` and ``rhs``.
+  Returns:
+    Transposed N-d convolution.
+  """
+  assert len(lhs.shape) == len(rhs.shape) and len(lhs.shape) >= 2
+  ndims = len(lhs.shape)
+  one = (1,) * (ndims - 2)
+  # Set dimensional layout defaults if not specified.
+  if dimension_numbers is None:
+    if ndims == 2:
+      dimension_numbers = ('NC', 'IO', 'NC')
+    elif ndims == 3:
+      dimension_numbers = ('NHC', 'HIO', 'NHC')
+    elif ndims == 4:
+      dimension_numbers = ('NHWC', 'HWIO', 'NHWC')
+    elif ndims == 5:
+      dimension_numbers = ('NHWDC', 'HWDIO', 'NHWDC')
+    else:
+      raise ValueError('No 4+ dimensional dimension_number defaults.')
+  dn = conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+  k_shape = np.take(rhs.shape, dn.rhs_spec)
+  k_sdims = k_shape[2:]  # type: ignore[index]
+  i_shape = np.take(lhs.shape, dn.lhs_spec)
+  i_sdims = i_shape[2:]  # type: ignore[index]
+
+  # Calculate correct output shape given padding and strides.
+  if dilation is None:
+    dilation = (1,) * (rhs.ndim - 2)
+
+  if output_padding is None:
+    output_padding = [None] * (rhs.ndim - 2)  # type: ignore[list-item]
+
+  if isinstance(padding, str):
+    if padding in {'SAME', 'VALID'}:
+      padding = [padding] * (rhs.ndim - 2)  # type: ignore[list-item]
+    else:
+      raise ValueError(f"`padding` must be 'VALID' or 'SAME'. Passed: {padding}.")
+
+  inferred_output_shape = tuple(map(_deconv_output_length, i_sdims, k_sdims,
+                              padding, output_padding, strides, dilation))
+  if output_shape is None:
+    output_shape = inferred_output_shape  # type: ignore[assignment]
+  else:
+    if not output_shape == inferred_output_shape:
+      raise ValueError(f"`output_padding` and `output_shape` are not compatible."
+                       f"Inferred output shape from `output_padding`: {inferred_output_shape}, "
+                       f"but got `output_shape` {output_shape}")
+
+  pads = tuple(map(_compute_adjusted_padding, i_sdims, output_shape,
+                   k_sdims, strides, padding, dilation))
+
+  if transpose_kernel:
+    # flip spatial dims and swap input / output channel axes
+    rhs = _flip_axes(rhs, np.array(dn.rhs_spec)[2:])
+    rhs = np.swapaxes(rhs, dn.rhs_spec[0], dn.rhs_spec[1])
+  return conv_general_dilated(lhs, rhs, one, pads, strides, dilation, dn,
+                              precision=precision)
+
+
 def _conv_general_dilated_shape_rule(
     lhs: core.ShapedArray, rhs: core.ShapedArray, *, window_strides, padding,
     lhs_dilation, rhs_dilation, dimension_numbers, feature_group_count,
@@ -524,6 +716,55 @@ def _conv_general_dilated_transpose_rhs(
       batch_group_count=batch_group_count, precision=precision,
       preferred_element_type=preferred_element_type)
 
+
+def _conv_general_dilated_translation_rule(
+    ctx, avals_in, avals_out, lhs, rhs, *, window_strides, padding,
+    lhs_dilation, rhs_dilation, dimension_numbers, feature_group_count,
+    batch_group_count, precision, expand_complex_convolutions,
+    preferred_element_type, **unused_kwargs):
+  assert type(dimension_numbers) is ConvDimensionNumbers
+  dimension_numbers = _conv_general_proto(dimension_numbers)
+  precision_config = lax._precision_config(precision)
+  dtype = avals_in[0].dtype
+  if expand_complex_convolutions and np.issubdtype(dtype, np.complexfloating):
+    # We use a trick for complex multiplication due to Gauss which uses three
+    # multiplications and five additions; instead of the naive method of four
+    # multiplications and two additions.
+    # https://en.wikipedia.org/wiki/Multiplication_algorithm#Complex_multiplication_algorithm
+    #
+    # This performance win comes with a trade-off in accuracy; especially in
+    # cases when the real and imaginary differ hugely in magnitude. The relative
+    # error bound (e.g. 1p-24 in case of float32) would be relative to the
+    # maximum of real and imaginary parts of the result instead of being
+    # satisfied by the real and imaginary parts independently of each other.
+    if preferred_element_type is not None:
+      # Convert complex dtype to types used for real and imaginary parts
+      assert np.issubdtype(preferred_element_type, np.complexfloating)
+      preferred_element_type = xla.dtype_to_primitive_type(np.dtype(
+          np.float64 if preferred_element_type == np.complex128
+          else np.float32))
+
+    conv = lambda x, y: xops.ConvGeneralDilated(
+        x, y, window_strides, padding, lhs_dilation, rhs_dilation,
+        dimension_numbers, feature_group_count, batch_group_count,
+        precision_config=precision_config,
+        preferred_element_type=preferred_element_type)
+    lhs_real, lhs_imag = xops.Real(lhs), xops.Imag(lhs)
+    rhs_real, rhs_imag = xops.Real(rhs), xops.Imag(rhs)
+    k1 = conv(xops.Add(lhs_real, lhs_imag), rhs_real)
+    k2 = conv(lhs_real, xops.Sub(rhs_imag, rhs_real))
+    k3 = conv(lhs_imag, xops.Add(rhs_real, rhs_imag))
+    return [xops.Complex(xops.Sub(k1, k3), xops.Add(k1, k2))]
+
+  if preferred_element_type is not None:
+    preferred_element_type = xla.dtype_to_primitive_type(preferred_element_type)
+
+  return [xops.ConvGeneralDilated(
+      lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation,
+      dimension_numbers, feature_group_count, batch_group_count,
+      precision_config=precision_config,
+      preferred_element_type=preferred_element_type)]
+
 def _conv_general_dilated_batch_rule(
     batched_args, batch_dims, *, window_strides, padding,
     lhs_dilation, rhs_dilation, dimension_numbers,
@@ -533,29 +774,6 @@ def _conv_general_dilated_batch_rule(
   lhs, rhs = batched_args
   lhs_bdim, rhs_bdim = batch_dims
   lhs_spec, rhs_spec, out_spec = dimension_numbers
-
-  # Some of the cases that reshape into batch or feature dimensions do not work
-  # with size 0 batch dimensions. The best fix would be to extend HLO to support
-  # multiple batch dimensions.
-  if ((lhs_bdim is not None and lhs.shape[lhs_bdim] == 0) or
-      (rhs_bdim is not None and rhs.shape[rhs_bdim] == 0)):
-    lhs_shape_unbatched, rhs_shape_unbatched = list(lhs.shape), list(rhs.shape)
-    if lhs_bdim is not None:
-      lhs_shape_unbatched.pop(lhs_bdim)
-    if rhs_bdim is not None:
-      rhs_shape_unbatched.pop(rhs_bdim)
-    shape = _conv_general_dilated_shape_rule(
-      core.ShapedArray(lhs_shape_unbatched, lhs.dtype),
-      core.ShapedArray(rhs_shape_unbatched, rhs.dtype),
-      window_strides=window_strides, padding=padding, lhs_dilation=lhs_dilation,
-      rhs_dilation=rhs_dilation, dimension_numbers=dimension_numbers,
-      feature_group_count=feature_group_count,
-      batch_group_count=batch_group_count)
-    return lax.full(
-      (0,) + shape, 0,
-      dtype=lhs.dtype if preferred_element_type is None
-            else preferred_element_type), 0
-
 
   if lhs_bdim is not None and rhs_bdim is not None:
     assert lhs.shape[lhs_bdim] == rhs.shape[rhs_bdim]
@@ -619,7 +837,8 @@ def _conv_general_dilated_batch_rule(
       new_rhs = _reshape_axis_out_of(rhs_spec[0] + int(rhs_bdim <= rhs_spec[0]),
                                      group_count, rhs)
       new_rhs = _reshape_axis_into(rhs_bdim + int(rhs_spec[0] < rhs_bdim),
-                                   rhs_spec[0] + 1, new_rhs)
+                                   rhs_spec[0] + 1,
+                                   new_rhs)
       new_rhs = _reshape_axis_into(rhs_spec[0], rhs_spec[0], new_rhs)
       out = conv_general_dilated(lhs, new_rhs, window_strides, padding,
                                  lhs_dilation, rhs_dilation, dimension_numbers,
@@ -658,7 +877,20 @@ def _conv_general_dilated_masking_rule(
 
 conv_general_dilated_p = lax.standard_primitive(
     _conv_general_dilated_shape_rule, _conv_general_dilated_dtype_rule,
-    'conv_general_dilated')
+    'conv_general_dilated', partial(_conv_general_dilated_translation_rule,
+                                    expand_complex_convolutions=False))
+
+# TODO(b/161124619, b/161126248): XLA does not support complex convolution on
+# GPU, and on CPU it uses a slow loop-based implementation;
+# on these backends, lower complex convolutions away.
+xla.register_translation(conv_general_dilated_p,
+                         partial(_conv_general_dilated_translation_rule,
+                                 expand_complex_convolutions=True),
+                         platform='cpu')
+xla.register_translation(conv_general_dilated_p,
+                         partial(_conv_general_dilated_translation_rule,
+                                 expand_complex_convolutions=True),
+                         platform='gpu')
 
 ad.defbilinear(conv_general_dilated_p,
                _conv_general_dilated_transpose_lhs,
@@ -728,26 +960,17 @@ def _conv_general_dilated_lower(
     output_spatial_dimensions=list(out_spec[2:]))
   num_spatial_dims = len(rhs_spec) - 2
   window_reversal = mlir.dense_bool_elements([False] * num_spatial_dims)
-  return [
-      mhlo.ConvOp(
-          mlir.aval_to_ir_type(aval_out),
-          lhs,
-          rhs,
-          dimension_numbers=dnums,
-          feature_group_count=mlir.i64_attr(feature_group_count),
-          batch_group_count=mlir.i64_attr(batch_group_count),
-          window_strides=mlir.dense_int_elements(window_strides),
-          padding=mlir.dense_int_elements(padding),
-          lhs_dilation=mlir.dense_int_elements(lhs_dilation),
-          rhs_dilation=mlir.dense_int_elements(rhs_dilation),
-          window_reversal=window_reversal,
-          precision_config=lax.precision_attr(precision)).result
-  ]
+  return [mhlo.ConvOp(mlir.aval_to_ir_type(aval_out), lhs, rhs,
+                      mlir.dense_int_elements(window_strides),
+                      mlir.dense_int_elements(padding),
+                      mlir.dense_int_elements(lhs_dilation),
+                      mlir.dense_int_elements(rhs_dilation),
+                      window_reversal, dnums,
+                      mlir.i64_attr(feature_group_count),
+                      mlir.i64_attr(batch_group_count),
+                      lax.precision_attr(precision)).result]
 
 mlir.register_lowering(conv_general_dilated_p, _conv_general_dilated_lower)
-# TODO(b/161124619, b/161126248): XLA does not support complex convolution on
-# GPU, and on CPU it uses a slow loop-based implementation;
-# on these backends, lower complex convolutions away.
 mlir.register_lowering(
     conv_general_dilated_p,
     partial(_conv_general_dilated_lower, expand_complex_convolutions=True),
@@ -759,10 +982,6 @@ mlir.register_lowering(
 
 
 def _reshape_axis_into(src, dst, x):
-  # NB: `dst` is the number of the dimension that we should reshape into
-  # *after* `src` is removed from `x`'s list of dimensions. For example, if
-  # `src` is an added batch dimension, `dst` might name a target dimension in
-  # the unbatched list of dimensions.
   perm = [i for i in range(x.ndim) if i != src]
   perm.insert(dst, src)
   new_shape = list(np.delete(x.shape, src))
@@ -943,7 +1162,7 @@ def _conv_general_vjp_lhs_padding(
   pad_before = np.subtract(rhs_dilated_shape, [lo for lo, _ in padding]) - 1
   pad_after = (np.add(lhs_dilated_shape, rhs_dilated_shape) - 1
                - out_dilated_shape - pad_before)
-  return util.safe_zip(pad_before, pad_after)
+  return safe_zip(pad_before, pad_after)
 
 
 def _conv_general_vjp_rhs_padding(
@@ -955,7 +1174,7 @@ def _conv_general_vjp_rhs_padding(
   lhs_dilated_shape = lax._dilate_shape(in_shape, lhs_dilation)
   rhs_dilated_shape = lax._dilate_shape(window_dimensions, rhs_dilation)
   out_dilated_shape = lax._dilate_shape(out_shape, window_strides)
-  pads_lo, _ = util.unzip2(padding)
+  pads_lo, _ = zip(*padding)
   pads_from_lhs = core.diff_shape(out_dilated_shape, lhs_dilated_shape)
   pads_from_rhs = core.diff_shape(core.diff_shape(rhs_dilated_shape, pads_lo),
                                   (1,) * len(pads_lo))
